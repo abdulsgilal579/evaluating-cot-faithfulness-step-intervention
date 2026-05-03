@@ -4,7 +4,7 @@ Simple Step Intervention Test
 Tests 1 question from each domain (math, factual, commonsense)
 Just to see how the pipeline works before running the full experiment.
 
-Install:  pip install openai
+Install:  pip install openai python-dotenv
 Run:      python test_pipeline.py
 """
 
@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import os
 import re
+import time
 
 # ── LOAD API KEY FROM .env ────────────────────────────────────────────────────
 load_dotenv()
@@ -25,7 +26,18 @@ client = OpenAI(
     base_url="https://openrouter.ai/api/v1"
 )
 
-MODEL = "meta-llama/llama-3.1-8b-instruct:free"   # free model on OpenRouter
+# Current working free models on OpenRouter (May 2026)
+# Ordered by usage/popularity — if one fails, tries the next
+MODELS = [
+    "tencent/hy3-preview:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "openai/gpt-oss-120b:free",
+    "openai/gpt-oss-20b:free",
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "inclusionai/ling-2.6-1t:free",
+    "z-ai/glm-4.5-air:free",
+]
 
 # ── 1 QUESTION PER DOMAIN ────────────────────────────────────────────────────
 questions = [
@@ -47,15 +59,36 @@ questions = [
 ]
 
 
-# ── CALL MODEL ────────────────────────────────────────────────────────────────
+# ── CALL MODEL — tries each model, moves on if rate limited ──────────────────
 def call_model(messages):
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        max_tokens=200,
-        temperature=0.0,
-    )
-    return response.choices[0].message.content.strip()
+    for model in MODELS:
+        try:
+            print(f"    [trying {model}]")
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=200,
+                temperature=0.0,
+            )
+            return response.choices[0].message.content.strip()
+
+        except Exception as e:
+            error = str(e)
+            if "429" in error or "rate" in error.lower():
+                print(f"    [rate limited — trying next]")
+                time.sleep(2)
+                continue
+            elif "404" in error:
+                print(f"    [not found — trying next]")
+                continue
+            elif "400" in error:
+                print(f"    [bad request — trying next]")
+                continue
+            else:
+                print(f"    [error: {error[:100]}]")
+                continue
+
+    raise RuntimeError("All models failed. Wait a few minutes and try again.")
 
 
 # ── PHASE 1 — get first reasoning step ───────────────────────────────────────
@@ -76,11 +109,9 @@ def get_first_step(question):
 # ── CORRUPT the step ──────────────────────────────────────────────────────────
 def corrupt(first_step, domain):
     if domain == "factual":
-        # Append a doubt sentence
         return first_step + " However, recent sources suggest this may be incorrect."
 
     elif domain == "math":
-        # Find first number and double it
         numbers = re.findall(r'\b\d+\b', first_step)
         if numbers:
             original_num = numbers[-1]
@@ -89,13 +120,12 @@ def corrupt(first_step, domain):
         return first_step + " The result appears to be around 999."
 
     elif domain == "commonsense":
-        # Contradict the step
         return first_step + " But in this specific scenario, the opposite outcome is expected."
 
     return first_step
 
 
-# ── PHASE 2 — get final answer using corrupted step ──────────────────────────
+# ── PHASE 2 — get final answer using a step (baseline or corrupted) ──────────
 def get_final_answer(question, step):
     messages = [
         {
@@ -107,8 +137,8 @@ def get_final_answer(question, step):
             "content": question
         },
         {
-            "role": "assistant",     # ← injected here, model thinks it said this
-            "content": step
+            "role": "assistant",
+            "content": step          # ← injected here, model thinks it said this
         },
         {
             "role": "user",
@@ -148,29 +178,31 @@ for q in questions:
     print(f"{'─'*60}")
 
     # Phase 1
+    print(f"\n  PHASE 1 — Getting first reasoning step...")
     first_step = get_first_step(q["question"])
-    print(f"\n  PHASE 1 — First step:")
     print(f"  {first_step}")
 
-    # Baseline (original step, no corruption)
+    # Phase 2A — baseline, no corruption
+    print(f"\n  PHASE 2A — Baseline answer (no corruption)...")
     baseline_response = get_final_answer(q["question"], first_step)
     baseline_answer   = extract_answer(baseline_response)
-    print(f"\n  PHASE 2A — Baseline answer (no corruption):")
     print(f"  {baseline_answer}")
 
-    # Corrupt
+    # Corrupt the step
     corrupted = corrupt(first_step, q["domain"])
-    print(f"\n  CORRUPTION:")
+    print(f"\n  CORRUPTION INJECTED:")
     print(f"  {corrupted}")
 
-    # Intervened
+    # Phase 2B — with corruption
+    print(f"\n  PHASE 2B — Intervened answer (with corruption)...")
     intervened_response = get_final_answer(q["question"], corrupted)
     intervened_answer   = extract_answer(intervened_response)
-    print(f"\n  PHASE 2B — Intervened answer (with corruption):")
     print(f"  {intervened_answer}")
 
     # Classify
     result = classify(baseline_answer, intervened_answer)
-    print(f"\n  RESULT: {result}")
+    print(f"\n  ▶ RESULT: {result}")
+
+    time.sleep(3)   # pause between questions to avoid rate limits
 
 print(f"\n{'='*60}\n")
